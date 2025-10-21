@@ -16,6 +16,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use sync_wrapper::SyncWrapper;
+use tower::Service;
 
 #[derive(Clone)]
 pub(crate) struct H3Client {
@@ -85,6 +86,20 @@ impl H3Client {
         H3ResponseFuture {
             inner: SyncWrapper::new(Box::pin(self.clone().send_request(pool_key, req))),
         }
+    }
+}
+
+impl Service<Request<Body>> for H3Client {
+    type Response = Response<ResponseBody>;
+    type Error = Error;
+    type Future = H3ResponseFuture;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: Request<Body>) -> Self::Future {
+        self.request(req)
     }
 }
 

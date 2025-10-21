@@ -5,11 +5,11 @@ use support::server;
 
 use std::env;
 
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 use tokio::sync::Mutex;
 
 // serialize tests that read from / write to environment variables
-static HTTP_PROXY_ENV_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+static HTTP_PROXY_ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[tokio::test]
 async fn http_proxy() {
@@ -169,6 +169,41 @@ async fn test_no_proxy() {
         .unwrap();
 
     assert_eq!(res.url().as_str(), &url);
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_custom_headers() {
+    let url = "http://hyper.rs.local/prox";
+    let server = server::http(move |req| {
+        assert_eq!(req.method(), "GET");
+        assert_eq!(req.uri(), url);
+        assert_eq!(req.headers()["host"], "hyper.rs.local");
+        assert_eq!(
+            req.headers()["proxy-authorization"],
+            "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
+        );
+        async { http::Response::default() }
+    });
+
+    let proxy = format!("http://{}", server.addr());
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        // reqwest::header::HeaderName::from_static("Proxy-Authorization"),
+        reqwest::header::PROXY_AUTHORIZATION,
+        "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==".parse().unwrap(),
+    );
+
+    let res = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::http(&proxy).unwrap().headers(headers))
+        .build()
+        .unwrap()
+        .get(url)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.url().as_str(), url);
     assert_eq!(res.status(), reqwest::StatusCode::OK);
 }
 
@@ -345,4 +380,66 @@ async fn tunnel_includes_user_agent() {
         "tunnel unsuccessful expected, got: {:?}",
         err
     );
+}
+
+#[tokio::test]
+async fn tunnel_includes_proxy_auth_with_multiple_proxies() {
+    let url = "http://hyper.rs.local/prox";
+    let server1 = server::http(move |req| {
+        assert_eq!(req.method(), "GET");
+        assert_eq!(req.uri(), url);
+        assert_eq!(req.headers()["host"], "hyper.rs.local");
+        assert_eq!(
+            req.headers()["proxy-authorization"],
+            "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
+        );
+        assert_eq!(req.headers()["proxy-header"], "proxy2");
+        async { http::Response::default() }
+    });
+
+    let proxy_url = format!("http://Aladdin:open%20sesame@{}", server1.addr());
+
+    let mut headers1 = reqwest::header::HeaderMap::new();
+    headers1.insert("proxy-header", "proxy1".parse().unwrap());
+
+    let mut headers2 = reqwest::header::HeaderMap::new();
+    headers2.insert("proxy-header", "proxy2".parse().unwrap());
+
+    let client = reqwest::Client::builder()
+        // When processing proxy headers, the first one is iterated,
+        // and if the current URL does not match, the proxy is skipped
+        .proxy(
+            reqwest::Proxy::https(&proxy_url)
+                .unwrap()
+                .headers(headers1.clone()),
+        )
+        // When processing proxy headers, the second one is iterated,
+        // and for the current URL matching, the proxy will be used
+        .proxy(
+            reqwest::Proxy::http(&proxy_url)
+                .unwrap()
+                .headers(headers2.clone()),
+        )
+        .build()
+        .unwrap();
+
+    let res = client.get(url).send().await.unwrap();
+
+    assert_eq!(res.url().as_str(), url);
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+
+    let client = reqwest::Client::builder()
+        // When processing proxy headers, the first one is iterated,
+        // and for the current URL matching, the proxy will be used
+        .proxy(reqwest::Proxy::http(&proxy_url).unwrap().headers(headers2))
+        // When processing proxy headers, the second one is iterated,
+        // and if the current URL does not match, the proxy is skipped
+        .proxy(reqwest::Proxy::https(&proxy_url).unwrap().headers(headers1))
+        .build()
+        .unwrap();
+
+    let res = client.get(url).send().await.unwrap();
+
+    assert_eq!(res.url().as_str(), url);
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
 }

@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
-use http::{header::HeaderValue, Uri};
+use http::{header::HeaderValue, HeaderMap, Uri};
 use hyper_util::client::proxy::matcher;
 
 use crate::into_url::{IntoUrl, IntoUrlSealed};
@@ -67,6 +67,7 @@ pub struct NoProxy {
 #[derive(Clone)]
 struct Extra {
     auth: Option<HeaderValue>,
+    misc: Option<HeaderMap>,
 }
 
 // ===== Internal =====
@@ -75,6 +76,7 @@ pub(crate) struct Matcher {
     inner: Matcher_,
     extra: Extra,
     maybe_has_http_auth: bool,
+    maybe_has_http_custom_headers: bool,
 }
 
 enum Matcher_ {
@@ -100,6 +102,14 @@ impl ProxyScheme {
             _ => None,
         }
     }
+
+    fn maybe_http_custom_headers(&self) -> Option<&HeaderMap> {
+        match self {
+            ProxyScheme::Http { misc, .. } | ProxyScheme::Https { misc, .. } => misc.as_ref(),
+            #[cfg(feature = "socks")]
+            _ => None,
+        }
+    }
 }
 */
 
@@ -113,7 +123,15 @@ pub trait IntoProxy {
 impl<S: IntoUrl> IntoProxy for S {
     fn into_proxy(self) -> crate::Result<Url> {
         match self.as_str().into_url() {
-            Ok(ok) => Ok(ok),
+            Ok(mut url) => {
+                // If the scheme is a SOCKS protocol and no port is specified, set the default
+                if url.port().is_none()
+                    && matches!(url.scheme(), "socks4" | "socks4a" | "socks5" | "socks5h")
+                {
+                    let _ = url.set_port(Some(1080));
+                }
+                Ok(url)
+            }
             Err(e) => {
                 let mut presumed_to_have_scheme = true;
                 let mut source = e.source();
@@ -245,7 +263,10 @@ impl Proxy {
 
     fn new(intercept: Intercept) -> Proxy {
         Proxy {
-            extra: Extra { auth: None },
+            extra: Extra {
+                auth: None,
+                misc: None,
+            },
             intercept,
             no_proxy: None,
         }
@@ -297,6 +318,32 @@ impl Proxy {
         self
     }
 
+    /// Adds a Custom Headers to Proxy
+    /// Adds custom headers to this Proxy
+    ///
+    /// # Example
+    /// ```
+    /// # extern crate reqwest;
+    /// # use reqwest::header::*;
+    /// # fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut headers = HeaderMap::new();
+    /// headers.insert(USER_AGENT, "reqwest".parse().unwrap());
+    /// let proxy = reqwest::Proxy::https("http://localhost:1234")?
+    ///     .headers(headers);
+    /// # Ok(())
+    /// # }
+    /// # fn main() {}
+    /// ```
+    pub fn headers(mut self, headers: HeaderMap) -> Proxy {
+        match self.intercept {
+            Intercept::All(_) | Intercept::Http(_) | Intercept::Https(_) | Intercept::Custom(_) => {
+                self.extra.misc = Some(headers);
+            }
+        }
+
+        self
+    }
+
     /// Adds a `No Proxy` exclusion list to this Proxy
     ///
     /// # Example
@@ -323,10 +370,13 @@ impl Proxy {
         } = self;
 
         let maybe_has_http_auth;
+        let maybe_has_http_custom_headers;
 
         let inner = match intercept {
             Intercept::All(url) => {
                 maybe_has_http_auth = cache_maybe_has_http_auth(&url, &extra.auth);
+                maybe_has_http_custom_headers =
+                    cache_maybe_has_http_custom_headers(&url, &extra.misc);
                 Matcher_::Util(
                     matcher::Matcher::builder()
                         .all(String::from(url))
@@ -336,6 +386,8 @@ impl Proxy {
             }
             Intercept::Http(url) => {
                 maybe_has_http_auth = cache_maybe_has_http_auth(&url, &extra.auth);
+                maybe_has_http_custom_headers =
+                    cache_maybe_has_http_custom_headers(&url, &extra.misc);
                 Matcher_::Util(
                     matcher::Matcher::builder()
                         .http(String::from(url))
@@ -345,6 +397,8 @@ impl Proxy {
             }
             Intercept::Https(url) => {
                 maybe_has_http_auth = cache_maybe_has_http_auth(&url, &extra.auth);
+                maybe_has_http_custom_headers =
+                    cache_maybe_has_http_custom_headers(&url, &extra.misc);
                 Matcher_::Util(
                     matcher::Matcher::builder()
                         .https(String::from(url))
@@ -354,6 +408,7 @@ impl Proxy {
             }
             Intercept::Custom(mut custom) => {
                 maybe_has_http_auth = true; // never know
+                maybe_has_http_custom_headers = true;
                 custom.no_proxy = no_proxy;
                 Matcher_::Custom(custom)
             }
@@ -363,6 +418,7 @@ impl Proxy {
             inner,
             extra,
             maybe_has_http_auth,
+            maybe_has_http_custom_headers,
         }
     }
 
@@ -397,6 +453,10 @@ impl Proxy {
 
 fn cache_maybe_has_http_auth(url: &Url, extra: &Option<HeaderValue>) -> bool {
     url.scheme() == "http" && (url.password().is_some() || extra.is_some())
+}
+
+fn cache_maybe_has_http_custom_headers(url: &Url, extra: &Option<HeaderMap>) -> bool {
+    url.scheme() == "http" && extra.is_some()
 }
 
 impl fmt::Debug for Proxy {
@@ -453,9 +513,13 @@ impl Matcher {
     pub(crate) fn system() -> Self {
         Self {
             inner: Matcher_::Util(matcher::Matcher::from_system()),
-            extra: Extra { auth: None },
+            extra: Extra {
+                auth: None,
+                misc: None,
+            },
             // maybe env vars have auth!
             maybe_has_http_auth: true,
+            maybe_has_http_custom_headers: true,
         }
     }
 
@@ -493,6 +557,20 @@ impl Matcher {
 
         None
     }
+
+    pub(crate) fn maybe_has_http_custom_headers(&self) -> bool {
+        self.maybe_has_http_custom_headers
+    }
+
+    pub(crate) fn http_non_tunnel_custom_headers(&self, dst: &Uri) -> Option<HeaderMap> {
+        if let Some(proxy) = self.intercept(dst) {
+            if proxy.uri().scheme_str() == Some("http") {
+                return proxy.custom_headers().cloned();
+            }
+        }
+
+        None
+    }
 }
 
 impl fmt::Debug for Matcher {
@@ -514,6 +592,13 @@ impl Intercepted {
             return Some(val);
         }
         self.inner.basic_auth()
+    }
+
+    pub(crate) fn custom_headers(&self) -> Option<&HeaderMap> {
+        if let Some(ref val) = self.extra.misc {
+            return Some(val);
+        }
+        None
     }
 
     #[cfg(feature = "socks")]
@@ -568,6 +653,25 @@ impl ProxyScheme {
             }
             ProxyScheme::Https { ref mut auth, .. } => {
                 *auth = Some(header_value);
+            }
+            #[cfg(feature = "socks")]
+            ProxyScheme::Socks4 { .. } => {
+                panic!("Socks4 is not supported for this method")
+            }
+            #[cfg(feature = "socks")]
+            ProxyScheme::Socks5 { .. } => {
+                panic!("Socks5 is not supported for this method")
+            }
+        }
+    }
+
+    fn set_custom_headers(&mut self, headers: HeaderMap) {
+        match *self {
+            ProxyScheme::Http { ref mut misc, .. } => {
+                misc.get_or_insert_with(HeaderMap::new).extend(headers)
+            }
+            ProxyScheme::Https { ref mut misc, .. } => {
+                misc.get_or_insert_with(HeaderMap::new).extend(headers)
             }
             #[cfg(feature = "socks")]
             ProxyScheme::Socks4 { .. } => {
@@ -813,5 +917,26 @@ mod tests {
             .unwrap()
             .into_matcher();
         assert!(m.maybe_has_http_auth(), "http forwards");
+    }
+
+    #[test]
+    fn test_socks_proxy_default_port() {
+        {
+            let m = Proxy::all("socks5://example.com").unwrap().into_matcher();
+
+            let http = "http://hyper.rs";
+            let https = "https://hyper.rs";
+
+            assert_eq!(intercepted_uri(&m, http).port_u16(), Some(1080));
+            assert_eq!(intercepted_uri(&m, https).port_u16(), Some(1080));
+
+            // custom port
+            let m = Proxy::all("socks5://example.com:1234")
+                .unwrap()
+                .into_matcher();
+
+            assert_eq!(intercepted_uri(&m, http).port_u16(), Some(1234));
+            assert_eq!(intercepted_uri(&m, https).port_u16(), Some(1234));
+        }
     }
 }

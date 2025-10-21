@@ -5,7 +5,7 @@ use http::uri::Scheme;
 use http::Uri;
 use hyper::rt::{Read, ReadBufCursor, Write};
 use hyper_util::client::legacy::connect::{Connected, Connection};
-#[cfg(any(feature = "socks", feature = "__tls"))]
+#[cfg(any(feature = "socks", feature = "__tls", unix))]
 use hyper_util::rt::TokioIo;
 #[cfg(feature = "default-tls")]
 use native_tls_crate::{TlsConnector, TlsConnectorBuilder};
@@ -80,6 +80,8 @@ pub(crate) struct ConnectorBuilder {
     user_agent: Option<HeaderValue>,
     #[cfg(feature = "socks")]
     resolver: Option<DynResolver>,
+    #[cfg(unix)]
+    unix_socket: Option<Arc<std::path::Path>>,
 }
 
 impl ConnectorBuilder {
@@ -99,7 +101,15 @@ where {
             simple_timeout: None,
             #[cfg(feature = "socks")]
             resolver: self.resolver.unwrap_or_else(DynResolver::gai),
+            #[cfg(unix)]
+            unix_socket: self.unix_socket,
         };
+
+        #[cfg(unix)]
+        if base_service.unix_socket.is_some() && !base_service.proxies.is_empty() {
+            base_service.proxies = Default::default();
+            log::trace!("unix_socket() set, proxies are ignored");
+        }
 
         if layers.is_empty() {
             // we have no user-provided layers, only use concrete types
@@ -196,6 +206,8 @@ where {
             timeout: None,
             #[cfg(feature = "socks")]
             resolver: None,
+            #[cfg(unix)]
+            unix_socket: None,
         }
     }
 
@@ -305,6 +317,8 @@ where {
             timeout: None,
             #[cfg(feature = "socks")]
             resolver: None,
+            #[cfg(unix)]
+            unix_socket: None,
         }
     }
 
@@ -376,6 +390,8 @@ where {
             timeout: None,
             #[cfg(feature = "socks")]
             resolver: None,
+            #[cfg(unix)]
+            unix_socket: None,
         }
     }
 
@@ -424,6 +440,23 @@ where {
     pub(crate) fn set_socks_resolver(&mut self, resolver: DynResolver) {
         self.resolver = Some(resolver);
     }
+
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    pub(crate) fn set_tcp_user_timeout(&mut self, dur: Option<Duration>) {
+        match &mut self.inner {
+            #[cfg(feature = "default-tls")]
+            Inner::DefaultTls(http, _tls) => http.set_tcp_user_timeout(dur),
+            #[cfg(feature = "__rustls")]
+            Inner::RustlsTls { http, .. } => http.set_tcp_user_timeout(dur),
+            #[cfg(not(feature = "__tls"))]
+            Inner::Http(http) => http.set_tcp_user_timeout(dur),
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn set_unix_socket(&mut self, path: Option<Arc<std::path::Path>>) {
+        self.unix_socket = path;
+    }
 }
 
 #[allow(missing_debug_implementations)]
@@ -445,6 +478,9 @@ pub(crate) struct ConnectorService {
     user_agent: Option<HeaderValue>,
     #[cfg(feature = "socks")]
     resolver: DynResolver,
+    /// If set, this always takes priority over TCP.
+    #[cfg(unix)]
+    unix_socket: Option<Arc<std::path::Path>>,
 }
 
 #[derive(Clone)]
@@ -461,23 +497,37 @@ enum Inner {
     },
 }
 
+impl Inner {
+    #[cfg(feature = "socks")]
+    fn get_http_connector(&mut self) -> &mut crate::connect::HttpConnector {
+        match self {
+            #[cfg(feature = "default-tls")]
+            Inner::DefaultTls(http, _) => http,
+            #[cfg(feature = "__rustls")]
+            Inner::RustlsTls { http, .. } => http,
+            #[cfg(not(feature = "__tls"))]
+            Inner::Http(http) => http,
+        }
+    }
+}
+
 impl ConnectorService {
     #[cfg(feature = "socks")]
-    async fn connect_socks(&self, dst: Uri, proxy: Intercepted) -> Result<Conn, BoxError> {
+    async fn connect_socks(mut self, dst: Uri, proxy: Intercepted) -> Result<Conn, BoxError> {
         let dns = match proxy.uri().scheme_str() {
             Some("socks4") | Some("socks5") => socks::DnsResolve::Local,
-            Some("socks4h") | Some("socks5h") => socks::DnsResolve::Proxy,
+            Some("socks4a") | Some("socks5h") => socks::DnsResolve::Proxy,
             _ => {
                 unreachable!("connect_socks is only called for socks proxies");
             }
         };
 
-        match &self.inner {
+        match &mut self.inner {
             #[cfg(feature = "default-tls")]
-            Inner::DefaultTls(_http, tls) => {
+            Inner::DefaultTls(http, tls) => {
                 if dst.scheme() == Some(&Scheme::HTTPS) {
                     let host = dst.host().ok_or("no host in url")?.to_string();
-                    let conn = socks::connect(proxy, dst, dns, &self.resolver).await?;
+                    let conn = socks::connect(proxy, dst, dns, &self.resolver, http).await?;
                     let conn = TokioIo::new(conn);
                     let conn = TokioIo::new(conn);
                     let tls_connector = tokio_native_tls::TlsConnector::from(tls.clone());
@@ -491,14 +541,14 @@ impl ConnectorService {
                 }
             }
             #[cfg(feature = "__rustls")]
-            Inner::RustlsTls { tls, .. } => {
+            Inner::RustlsTls { http, tls, .. } => {
                 if dst.scheme() == Some(&Scheme::HTTPS) {
                     use std::convert::TryFrom;
                     use tokio_rustls::TlsConnector as RustlsConnector;
 
                     let tls = tls.clone();
                     let host = dst.host().ok_or("no host in url")?.to_string();
-                    let conn = socks::connect(proxy, dst, dns, &self.resolver).await?;
+                    let conn = socks::connect(proxy, dst, dns, &self.resolver, http).await?;
                     let conn = TokioIo::new(conn);
                     let conn = TokioIo::new(conn);
                     let server_name =
@@ -516,16 +566,26 @@ impl ConnectorService {
                 }
             }
             #[cfg(not(feature = "__tls"))]
-            Inner::Http(_) => (),
+            Inner::Http(http) => {
+                let conn = socks::connect(proxy, dst, dns, &self.resolver, http).await?;
+                return Ok(Conn {
+                    inner: self.verbose.wrap(TokioIo::new(conn)),
+                    is_proxy: false,
+                    tls_info: false,
+                });
+            }
         }
 
-        socks::connect(proxy, dst, dns, &self.resolver)
+        let resolver = &self.resolver;
+        let http = self.inner.get_http_connector();
+        socks::connect(proxy, dst, dns, resolver, http)
             .await
             .map(|tcp| Conn {
                 inner: self.verbose.wrap(TokioIo::new(tcp)),
                 is_proxy: false,
                 tls_info: false,
             })
+            .map_err(Into::into)
     }
 
     async fn connect_with_maybe_proxy(self, dst: Uri, is_proxy: bool) -> Result<Conn, BoxError> {
@@ -613,12 +673,81 @@ impl ConnectorService {
         }
     }
 
+    /// Connect over Unix Domain Socket (or Windows?).
+    #[cfg(unix)]
+    async fn connect_local_transport(self, dst: Uri) -> Result<Conn, BoxError> {
+        let path = self
+            .unix_socket
+            .as_ref()
+            .expect("connect local must have socket path")
+            .clone();
+        let svc = tower::service_fn(move |_| {
+            let fut = tokio::net::UnixStream::connect(path.clone());
+            async move {
+                let io = fut.await?;
+                Ok::<_, std::io::Error>(TokioIo::new(io))
+            }
+        });
+        let is_proxy = false;
+        match self.inner {
+            #[cfg(not(feature = "__tls"))]
+            Inner::Http(..) => {
+                let mut svc = svc;
+                let io = svc.call(dst).await?;
+                Ok(Conn {
+                    inner: self.verbose.wrap(io),
+                    is_proxy,
+                    tls_info: false,
+                })
+            }
+            #[cfg(feature = "default-tls")]
+            Inner::DefaultTls(_, tls) => {
+                let tls_connector = tokio_native_tls::TlsConnector::from(tls.clone());
+                let mut http = hyper_tls::HttpsConnector::from((svc, tls_connector));
+                let io = http.call(dst).await?;
+
+                if let hyper_tls::MaybeHttpsStream::Https(stream) = io {
+                    Ok(Conn {
+                        inner: self.verbose.wrap(NativeTlsConn { inner: stream }),
+                        is_proxy,
+                        tls_info: self.tls_info,
+                    })
+                } else {
+                    Ok(Conn {
+                        inner: self.verbose.wrap(io),
+                        is_proxy,
+                        tls_info: false,
+                    })
+                }
+            }
+            #[cfg(feature = "__rustls")]
+            Inner::RustlsTls { tls, .. } => {
+                let mut http = hyper_rustls::HttpsConnector::from((svc, tls.clone()));
+                let io = http.call(dst).await?;
+
+                if let hyper_rustls::MaybeHttpsStream::Https(stream) = io {
+                    Ok(Conn {
+                        inner: self.verbose.wrap(RustlsTlsConn { inner: stream }),
+                        is_proxy,
+                        tls_info: self.tls_info,
+                    })
+                } else {
+                    Ok(Conn {
+                        inner: self.verbose.wrap(io),
+                        is_proxy,
+                        tls_info: false,
+                    })
+                }
+            }
+        }
+    }
+
     async fn connect_via_proxy(self, dst: Uri, proxy: Intercepted) -> Result<Conn, BoxError> {
         log::debug!("proxy({proxy:?}) intercepts '{dst:?}'");
 
         #[cfg(feature = "socks")]
         match proxy.uri().scheme_str().ok_or("proxy scheme expected")? {
-            "socks4" | "socks4h" | "socks5" | "socks5h" => {
+            "socks4" | "socks4a" | "socks5" | "socks5h" => {
                 return self.connect_socks(dst, proxy).await
             }
             _ => (),
@@ -627,6 +756,9 @@ impl ConnectorService {
         let proxy_dst = proxy.uri().clone();
         #[cfg(feature = "__tls")]
         let auth = proxy.basic_auth().cloned();
+
+        #[cfg(feature = "__tls")]
+        let misc = proxy.custom_headers().clone();
 
         match &self.inner {
             #[cfg(feature = "default-tls")]
@@ -646,6 +778,10 @@ impl ConnectorService {
                         let mut headers = http::HeaderMap::new();
                         headers.insert(http::header::USER_AGENT, ua);
                         tunnel = tunnel.with_headers(headers);
+                    }
+                    // Note that custom headers may override the user agent header.
+                    if let Some(custom_headers) = misc {
+                        tunnel = tunnel.with_headers(custom_headers.clone());
                     }
                     // We don't wrap this again in an HttpsConnector since that uses Maybe,
                     // and we know this is definitely HTTPS.
@@ -682,6 +818,9 @@ impl ConnectorService {
                         hyper_util::client::legacy::connect::proxy::Tunnel::new(proxy_dst, inner);
                     if let Some(auth) = auth {
                         tunnel = tunnel.with_auth(auth);
+                    }
+                    if let Some(custom_headers) = misc {
+                        tunnel = tunnel.with_headers(custom_headers.clone());
                     }
                     if let Some(ua) = self.user_agent {
                         let mut headers = http::HeaderMap::new();
@@ -742,6 +881,16 @@ impl Service<Uri> for ConnectorService {
     fn call(&mut self, dst: Uri) -> Self::Future {
         // log::debug!("starting new connection: {dst:?}");
         let timeout = self.simple_timeout;
+
+        // Local transports (UDS) skip proxies
+        #[cfg(unix)]
+        if self.unix_socket.is_some() {
+            return Box::pin(with_timeout(
+                self.clone().connect_local_transport(dst),
+                timeout,
+            ));
+        }
+
         for prox in self.proxies.iter() {
             if let Some(intercepted) = prox.intercept(&dst) {
                 return Box::pin(with_timeout(
@@ -764,16 +913,18 @@ trait TlsInfoFactory {
 }
 
 #[cfg(feature = "__tls")]
-impl TlsInfoFactory for tokio::net::TcpStream {
-    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
-        None
-    }
-}
-
-#[cfg(feature = "__tls")]
 impl<T: TlsInfoFactory> TlsInfoFactory for TokioIo<T> {
     fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
         self.inner().tls_info()
+    }
+}
+
+// ===== TcpStream =====
+
+#[cfg(feature = "__tls")]
+impl TlsInfoFactory for tokio::net::TcpStream {
+    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+        None
     }
 }
 
@@ -849,6 +1000,102 @@ impl TlsInfoFactory
 
 #[cfg(feature = "__rustls")]
 impl TlsInfoFactory for hyper_rustls::MaybeHttpsStream<TokioIo<tokio::net::TcpStream>> {
+    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+        match self {
+            hyper_rustls::MaybeHttpsStream::Https(tls) => tls.tls_info(),
+            hyper_rustls::MaybeHttpsStream::Http(_) => None,
+        }
+    }
+}
+
+// ===== UnixStream =====
+
+#[cfg(feature = "__tls")]
+#[cfg(unix)]
+impl TlsInfoFactory for tokio::net::UnixStream {
+    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+        None
+    }
+}
+
+#[cfg(feature = "default-tls")]
+#[cfg(unix)]
+impl TlsInfoFactory for tokio_native_tls::TlsStream<TokioIo<TokioIo<tokio::net::UnixStream>>> {
+    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+        let peer_certificate = self
+            .get_ref()
+            .peer_certificate()
+            .ok()
+            .flatten()
+            .and_then(|c| c.to_der().ok());
+        Some(crate::tls::TlsInfo { peer_certificate })
+    }
+}
+
+#[cfg(feature = "default-tls")]
+#[cfg(unix)]
+impl TlsInfoFactory
+    for tokio_native_tls::TlsStream<
+        TokioIo<hyper_tls::MaybeHttpsStream<TokioIo<tokio::net::UnixStream>>>,
+    >
+{
+    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+        let peer_certificate = self
+            .get_ref()
+            .peer_certificate()
+            .ok()
+            .flatten()
+            .and_then(|c| c.to_der().ok());
+        Some(crate::tls::TlsInfo { peer_certificate })
+    }
+}
+
+#[cfg(feature = "default-tls")]
+#[cfg(unix)]
+impl TlsInfoFactory for hyper_tls::MaybeHttpsStream<TokioIo<tokio::net::UnixStream>> {
+    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+        match self {
+            hyper_tls::MaybeHttpsStream::Https(tls) => tls.tls_info(),
+            hyper_tls::MaybeHttpsStream::Http(_) => None,
+        }
+    }
+}
+
+#[cfg(feature = "__rustls")]
+#[cfg(unix)]
+impl TlsInfoFactory for tokio_rustls::client::TlsStream<TokioIo<TokioIo<tokio::net::UnixStream>>> {
+    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+        let peer_certificate = self
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|certs| certs.first())
+            .map(|c| c.to_vec());
+        Some(crate::tls::TlsInfo { peer_certificate })
+    }
+}
+
+#[cfg(feature = "__rustls")]
+#[cfg(unix)]
+impl TlsInfoFactory
+    for tokio_rustls::client::TlsStream<
+        TokioIo<hyper_rustls::MaybeHttpsStream<TokioIo<tokio::net::UnixStream>>>,
+    >
+{
+    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+        let peer_certificate = self
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|certs| certs.first())
+            .map(|c| c.to_vec());
+        Some(crate::tls::TlsInfo { peer_certificate })
+    }
+}
+
+#[cfg(feature = "__rustls")]
+#[cfg(unix)]
+impl TlsInfoFactory for hyper_rustls::MaybeHttpsStream<TokioIo<tokio::net::UnixStream>> {
     fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
         match self {
             hyper_rustls::MaybeHttpsStream::Https(tls) => tls.tls_info(),
@@ -960,6 +1207,48 @@ pub(crate) mod sealed {
     }
 }
 
+// Some sealed things for UDS
+#[cfg(unix)]
+pub(crate) mod uds {
+    use std::path::Path;
+
+    /// A provider for Unix Domain Socket paths.
+    ///
+    /// This trait is sealed. This allows us expand the support in the future
+    /// by controlling who can implement the trait.
+    ///
+    /// It's available in the docs to see what type may be passed in.
+    #[cfg(unix)]
+    pub trait UnixSocketProvider {
+        #[doc(hidden)]
+        fn reqwest_uds_path(&self, _: Internal) -> &Path;
+    }
+
+    #[allow(missing_debug_implementations)]
+    pub struct Internal;
+
+    macro_rules! as_path {
+        ($($t:ty,)+) => {
+            $(
+                impl UnixSocketProvider for $t {
+                    #[doc(hidden)]
+                    fn reqwest_uds_path(&self, _: Internal) -> &Path {
+                        self.as_ref()
+                    }
+                }
+            )+
+        }
+    }
+
+    as_path![
+        String,
+        &'_ str,
+        &'_ Path,
+        std::path::PathBuf,
+        std::sync::Arc<Path>,
+    ];
+}
+
 pub(crate) type Connecting = Pin<Box<dyn Future<Output = Result<Conn, BoxError>> + Send>>;
 
 #[cfg(feature = "default-tls")]
@@ -1015,6 +1304,34 @@ mod native_tls_conn {
                 .get_ref()
                 .inner()
                 .connected();
+            #[cfg(feature = "native-tls-alpn")]
+            match self.inner.inner().get_ref().negotiated_alpn().ok() {
+                Some(Some(alpn_protocol)) if alpn_protocol == b"h2" => connected.negotiated_h2(),
+                _ => connected,
+            }
+            #[cfg(not(feature = "native-tls-alpn"))]
+            connected
+        }
+    }
+
+    #[cfg(unix)]
+    impl Connection for NativeTlsConn<TokioIo<TokioIo<tokio::net::UnixStream>>> {
+        fn connected(&self) -> Connected {
+            let connected = Connected::new();
+            #[cfg(feature = "native-tls-alpn")]
+            match self.inner.inner().get_ref().negotiated_alpn().ok() {
+                Some(Some(alpn_protocol)) if alpn_protocol == b"h2" => connected.negotiated_h2(),
+                _ => connected,
+            }
+            #[cfg(not(feature = "native-tls-alpn"))]
+            connected
+        }
+    }
+
+    #[cfg(unix)]
+    impl Connection for NativeTlsConn<TokioIo<MaybeHttpsStream<TokioIo<tokio::net::UnixStream>>>> {
+        fn connected(&self) -> Connected {
+            let connected = Connected::new();
             #[cfg(feature = "native-tls-alpn")]
             match self.inner.inner().get_ref().negotiated_alpn().ok() {
                 Some(Some(alpn_protocol)) if alpn_protocol == b"h2" => connected.negotiated_h2(),
@@ -1140,6 +1457,40 @@ mod rustls_tls_conn {
         }
     }
 
+    #[cfg(unix)]
+    impl Connection for RustlsTlsConn<TokioIo<TokioIo<tokio::net::UnixStream>>> {
+        fn connected(&self) -> Connected {
+            if self.inner.inner().get_ref().1.alpn_protocol() == Some(b"h2") {
+                self.inner
+                    .inner()
+                    .get_ref()
+                    .0
+                    .inner()
+                    .connected()
+                    .negotiated_h2()
+            } else {
+                self.inner.inner().get_ref().0.inner().connected()
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Connection for RustlsTlsConn<TokioIo<MaybeHttpsStream<TokioIo<tokio::net::UnixStream>>>> {
+        fn connected(&self) -> Connected {
+            if self.inner.inner().get_ref().1.alpn_protocol() == Some(b"h2") {
+                self.inner
+                    .inner()
+                    .get_ref()
+                    .0
+                    .inner()
+                    .connected()
+                    .negotiated_h2()
+            } else {
+                self.inner.inner().get_ref().0.inner().connected()
+            }
+        }
+    }
+
     impl<T: AsyncRead + AsyncWrite + Unpin> Read for RustlsTlsConn<T> {
         fn poll_read(
             self: Pin<&mut Self>,
@@ -1202,13 +1553,14 @@ mod rustls_tls_conn {
 
 #[cfg(feature = "socks")]
 mod socks {
-    use std::io;
+    use tower_service::Service;
 
+    use http::uri::Scheme;
     use http::Uri;
+    use hyper_util::client::legacy::connect::proxy::{SocksV4, SocksV5};
     use tokio::net::TcpStream;
-    use tokio_socks::tcp::{Socks4Stream, Socks5Stream};
 
-    use super::{BoxError, Scheme};
+    use super::BoxError;
     use crate::proxy::Intercepted;
 
     pub(super) enum DnsResolve {
@@ -1216,16 +1568,22 @@ mod socks {
         Proxy,
     }
 
+    #[derive(Debug)]
+    pub(super) enum SocksProxyError {
+        SocksNoHostInUrl,
+        SocksLocalResolve(BoxError),
+        SocksConnect(BoxError),
+    }
+
     pub(super) async fn connect(
         proxy: Intercepted,
         dst: Uri,
         dns_mode: DnsResolve,
         resolver: &crate::dns::DynResolver,
-    ) -> Result<TcpStream, BoxError> {
+        http_connector: &mut crate::connect::HttpConnector,
+    ) -> Result<TcpStream, SocksProxyError> {
         let https = dst.scheme() == Some(&Scheme::HTTPS);
-        let original_host = dst
-            .host()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no host in url"))?;
+        let original_host = dst.host().ok_or(SocksProxyError::SocksNoHostInUrl)?;
         let mut host = original_host.to_owned();
         let port = match dst.port() {
             Some(p) => p.as_u16(),
@@ -1234,50 +1592,82 @@ mod socks {
         };
 
         if let DnsResolve::Local = dns_mode {
-            let maybe_new_target = resolver.http_resolve(&dst).await?.next();
+            let maybe_new_target = resolver
+                .http_resolve(&dst)
+                .await
+                .map_err(SocksProxyError::SocksLocalResolve)?
+                .next();
             if let Some(new_target) = maybe_new_target {
-                host = new_target.ip().to_string();
+                log::trace!("socks local dns resolved {new_target:?}");
+                // If the resolved IP is IPv6, wrap it in brackets for URI formatting
+                let ip = new_target.ip();
+                if ip.is_ipv6() {
+                    host = format!("[{}]", ip);
+                } else {
+                    host = ip.to_string();
+                }
             }
         }
 
-        let addr = resolver
-            .http_resolve(proxy.uri())
-            .await?
-            .next()
-            .ok_or("proxy dns resolve is empty")?;
+        let proxy_uri = proxy.uri().clone();
+        // Build a Uri for the destination
+        let dst_uri = format!(
+            "{}://{}:{}",
+            if https { "https" } else { "http" },
+            host,
+            port
+        )
+        .parse::<Uri>()
+        .map_err(|e| SocksProxyError::SocksConnect(e.into()))?;
 
         // TODO: can `Scheme::from_static()` be const fn, compare with a SOCKS5 constant?
         match proxy.uri().scheme_str() {
-            Some("socks4") | Some("socks4h") => {
-                let stream = Socks4Stream::connect(addr, (host.as_str(), port))
+            Some("socks4") | Some("socks4a") => {
+                let mut svc = SocksV4::new(proxy_uri, http_connector);
+                let stream = Service::call(&mut svc, dst_uri)
                     .await
-                    .map_err(|e| format!("socks connect error: {e}"))?;
+                    .map_err(|e| SocksProxyError::SocksConnect(e.into()))?;
                 Ok(stream.into_inner())
             }
             Some("socks5") | Some("socks5h") => {
-                let stream = if let Some((username, password)) = proxy.raw_auth() {
-                    Socks5Stream::connect_with_password(
-                        addr,
-                        (host.as_str(), port),
-                        &username,
-                        &password,
-                    )
-                    .await
-                    .map_err(|e| format!("socks connect error: {e}"))?
+                let mut svc = if let Some((username, password)) = proxy.raw_auth() {
+                    SocksV5::new(proxy_uri, http_connector)
+                        .with_auth(username.to_string(), password.to_string())
                 } else {
-                    Socks5Stream::connect(addr, (host.as_str(), port))
-                        .await
-                        .map_err(|e| format!("socks connect error: {e}"))?
+                    SocksV5::new(proxy_uri, http_connector)
                 };
-
+                let stream = Service::call(&mut svc, dst_uri)
+                    .await
+                    .map_err(|e| SocksProxyError::SocksConnect(e.into()))?;
                 Ok(stream.into_inner())
             }
             _ => unreachable!(),
         }
     }
+
+    impl std::fmt::Display for SocksProxyError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::SocksNoHostInUrl => f.write_str("socks proxy destination has no host"),
+                Self::SocksLocalResolve(_) => f.write_str("error resolving for socks proxy"),
+                Self::SocksConnect(_) => f.write_str("error connecting to socks proxy"),
+            }
+        }
+    }
+
+    impl std::error::Error for SocksProxyError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::SocksNoHostInUrl => None,
+                Self::SocksLocalResolve(ref e) => Some(&**e),
+                Self::SocksConnect(ref e) => Some(&**e),
+            }
+        }
+    }
 }
 
 mod verbose {
+    use crate::util::Escape;
     use hyper::rt::{Read, ReadBufCursor, Write};
     use hyper_util::client::legacy::connect::{Connected, Connection};
     use std::cmp::min;
@@ -1328,7 +1718,7 @@ mod verbose {
             let mut vbuf = hyper::rt::ReadBuf::uninit(unsafe { buf.as_mut() });
             match Pin::new(&mut self.inner).poll_read(cx, vbuf.unfilled()) {
                 Poll::Ready(Ok(())) => {
-                    log::trace!("{:08x} read: {:?}", self.id, Escape(vbuf.filled()));
+                    log::trace!("{:08x} read: {:?}", self.id, Escape::new(vbuf.filled()));
                     let len = vbuf.filled().len();
                     // SAFETY: The two cursors were for the same buffer. What was
                     // filled in one is safe in the other.
@@ -1351,7 +1741,7 @@ mod verbose {
         ) -> Poll<Result<usize, std::io::Error>> {
             match Pin::new(&mut self.inner).poll_write(cx, buf) {
                 Poll::Ready(Ok(n)) => {
-                    log::trace!("{:08x} write: {:?}", self.id, Escape(&buf[..n]));
+                    log::trace!("{:08x} write: {:?}", self.id, Escape::new(&buf[..n]));
                     Poll::Ready(Ok(n))
                 }
                 Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
@@ -1404,35 +1794,6 @@ mod verbose {
         }
     }
 
-    struct Escape<'a>(&'a [u8]);
-
-    impl fmt::Debug for Escape<'_> {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "b\"")?;
-            for &c in self.0 {
-                // https://doc.rust-lang.org/reference.html#byte-escapes
-                if c == b'\n' {
-                    write!(f, "\\n")?;
-                } else if c == b'\r' {
-                    write!(f, "\\r")?;
-                } else if c == b'\t' {
-                    write!(f, "\\t")?;
-                } else if c == b'\\' || c == b'"' {
-                    write!(f, "\\{}", c as char)?;
-                } else if c == b'\0' {
-                    write!(f, "\\0")?;
-                // ASCII printable
-                } else if c >= 0x20 && c < 0x7f {
-                    write!(f, "{}", c as char)?;
-                } else {
-                    write!(f, "\\x{c:02x}")?;
-                }
-            }
-            write!(f, "\"")?;
-            Ok(())
-        }
-    }
-
     struct Vectored<'a, 'b> {
         bufs: &'a [IoSlice<'b>],
         nwritten: usize,
@@ -1446,7 +1807,7 @@ mod verbose {
                     break;
                 }
                 let n = min(left, buf.len());
-                Escape(&buf[..n]).fmt(f)?;
+                Escape::new(&buf[..n]).fmt(f)?;
                 left -= n;
             }
             Ok(())
